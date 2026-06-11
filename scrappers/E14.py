@@ -6,10 +6,17 @@ import json
 
 class E14Extractor():
 
-    def __init__(self, src, canvass_type="V", render_scale=3, verbose=False):
+    votes_feature = cv2.imread("features/vote_feature.png", cv2.IMREAD_GRAYSCALE)
+    c1_feature = cv2.imread("features/c1_features.png", cv2.IMREAD_GRAYSCALE)
+    c2_feature = cv2.imread("features/c2_features.png", cv2.IMREAD_GRAYSCALE)
+    nivelation_feature = cv2.imread("features/nivelation_feature.png", cv2.IMREAD_GRAYSCALE)
+    total_feature = cv2.imread("features/total_feature.png", cv2.IMREAD_GRAYSCALE)
+
+
+    def __init__(self, src, canvass_type="V", render_scale=3, verbose=False, custom_limits = {}):
         cv2.useOptimized()
         self.canvass_type = canvass_type
-        self.set_sections_limits()
+        self.set_sections_limits(custom_limits)
         self.set_cell_size()
         self.src = src
         self.render_scale = render_scale
@@ -18,15 +25,21 @@ class E14Extractor():
         self.logs = []
         self.treshold_value = 127
 
-    def set_sections_limits(self,):
+    def set_sections_limits(self, custom_limits=None):
         if self.canvass_type == "V":
             squares_x = [0.73, 0.985]
-            self.page_lims = {"x": [0, 1],    "y": [0.225, 0.96]}
-            self.nivelation_lims = {"x": squares_x, "y": [0.2,  0.95]}
-            self.candidates_lims = {"x": squares_x,  "y": [1/3, 2/3]}
-            self.total_count_lims = {"x": squares_x, "y": [0.05, 0.95]}
+            self.page_lims = custom_limits.get("page", {"x": [0, 1], "y": [0.225, 0.96]})
+            self.nivelation_lims = custom_limits.get("nivelation", {"x": squares_x, "y": [0.2, 0.95]})
+            self.candidates_lims = custom_limits.get("candidates", {"x": squares_x, "y": [1/3, 2/3]})
+            self.total_count_lims = custom_limits.get("total_count", {"x": squares_x, "y": [0.05, 0.95]})
         else:
             pass
+
+    def change_limits(self, limit_name, new_lims):
+        if hasattr(self, f"{limit_name}_lims"):
+            setattr(self, f"{limit_name}_lims", new_lims)
+        else:
+            raise ValueError(f"Invalid limit name: {limit_name}")
 
     def set_cell_size(self,):
         if self.canvass_type == "V":
@@ -73,6 +86,7 @@ class E14Extractor():
                 image, (int(image.shape[1]*scale), int(image.shape[0]*scale))))
             cv2.waitKey(0)
             cv2.destroyAllWindows()
+            cv2.waitKey(1)
 
     def display_contours(self, image, contours, prop=1, index=-1):
         """ Display the image with the contours drawn on it
@@ -165,11 +179,8 @@ class E14Extractor():
             image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = self.get_valid_contours(image, contours)
         if len(contours) != expected_n:
-            if self.verbose:
-                print(
-                    f"Warning: Expected {expected_n} contours, found {len(contours)}")
-            self.logs.append(
-                f"Warning: Expected {expected_n} contours, found {len(contours)}")
+            raise ValueError(
+                f"Expected {expected_n} contours, but found {len(contours)}")
         contours = self.sort_contours(contours)
 
         return contours
@@ -188,7 +199,111 @@ class E14Extractor():
         x, y, w, h = cv2.boundingRect(contour)
         return self.crop_image(image[y:y+h, x:x+w], lims)
 
-    def resolve_first_page(self, image):
+    def get_feature_image(self, src):
+        return cv2.imread(src, cv2.IMREAD_GRAYSCALE)
+
+    def match_feature(self, image, feature, threshold_match=0.8, min_match_count=10, draw = False):
+        
+        sift = cv2.SIFT_create()
+        kpf, desf = sift.detectAndCompute(feature,None)
+        kpim, desim = sift.detectAndCompute(image,None)
+        index_params = dict(algorithm = 1, trees = 5)
+        search_params = dict(checks = 50)
+        flann = cv2.FlannBasedMatcher(index_params, search_params)
+        matches = flann.knnMatch(desf,desim,k=2)
+        valid_matches = [m for m,n in matches if m.distance < threshold_match*n.distance]
+
+        if len(valid_matches)>min_match_count:
+            src_pts = np.float32([ kpf[m.queryIdx].pt for m in valid_matches ]).reshape(-1,1,2)
+            dst_pts = np.float32([ kpim[m.trainIdx].pt for m in valid_matches ]).reshape(-1,1,2)
+            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC,5.0)
+            matchesMask = mask.ravel().tolist()
+            h,w = feature.shape
+            pts = np.float32([ [0,0],[0,h-1],[w-1,h-1],[w-1,0] ]).reshape(-1,1,2)
+            dst = cv2.perspectiveTransform(pts,M)
+        else:
+            raise ValueError(f"Not enough matches are found - {len(valid_matches)}/{min_match_count}")
+        
+        if draw:
+            draw_image = cv2.polylines(image.copy(), [np.int32(dst)], True, 50, 3, cv2.LINE_AA)
+            draw_params = dict(matchColor = (0,255,0),singlePointColor = None,
+                        matchesMask = matchesMask, flags = 2)
+            match_images = cv2.drawMatches(feature,kpf,draw_image,kpim,valid_matches,None,**draw_params)  
+            return dst, match_images
+        return dst   
+
+    def get_feature_center(self, dst):
+        return np.mean(np.array(dst).reshape(-1, 2), axis=0)  
+    
+    def get_candidates_distance(self, dst_c1, dst_c2):
+        center_c1 = self.get_feature_center(dst_c1)
+        center_c2 = self.get_feature_center(dst_c2)
+        return abs(center_c1[1] - center_c2[1])
+    
+    def get_vote_to_candidate_distance(self, dst_vote, first_candidate_dst):
+        center_vote = self.get_feature_center(dst_vote)
+        center_candidate = self.get_feature_center(first_candidate_dst)
+        return abs(center_vote[1] - center_candidate[1])
+
+    def get_features_relations(self, image, vote_feature, c1_feature, c2_feature):
+        votes_dst = self.match_feature(image, vote_feature)
+        c1_dst = self.match_feature(image, c1_feature)
+        c2_dst = self.match_feature(image, c2_feature)
+
+        dvc = self.get_vote_to_candidate_distance(votes_dst, c1_dst)
+        dy_candidates = self.get_candidates_distance(c1_dst, c2_dst)
+
+        return dvc, dy_candidates
+
+    def get_candidates_centers(self, center_vote, dvc, dc, n_candidates=7):
+        dy = dc
+        centers = []
+        for i in range(n_candidates):
+            center_candidate = [center_vote[0], center_vote[1] + dvc + i*dy]
+            centers.append(center_candidate)
+        return centers
+    
+    def get_candidate_squares(self, image, candidate_centers, dx_square, dy_square):
+        candidate_squares = []
+        for center in candidate_centers:
+            square = image[int(center[1]-dy_square/2):int(center[1]+dy_square/2),
+                        int(center[0]-dx_square/2):int(center[0]+dx_square/2)]
+            candidate_squares.append(square)
+        return candidate_squares
+
+    def resolve_first_page_by_features(self, image, vote_feature, dvc, dy_candidates):
+        center_vote = self.get_feature_center(self.match_feature(image, vote_feature))
+        dx_squares = vote_feature.shape[1]
+        dy_square = int(dx_squares/3)
+        candidates_centers = self.get_candidates_centers(center_vote, dvc, dy_candidates, n_candidates=7)
+        candidates_squares = self.get_candidate_squares(image, candidates_centers, dx_squares, dy_square)
+        dst_n = self.match_feature(image, self.nivelation_feature)
+        center_n = self.get_feature_center(dst_n)
+        nivelation_square = image[int(center_n[1]-3*dy_square/2):int(center_n[1]+3*dy_square/2),
+                                int(center_vote[0]-dx_squares/2):int(center_vote[0]+dx_squares/2)]
+        return nivelation_square, candidates_squares
+    
+    def resolve_second_page_by_features(self, image, vote_feature, dvc, dy_candidates):
+        center_vote = self.get_feature_center(self.match_feature(image, vote_feature))
+        dx_squares = vote_feature.shape[1]
+        dy_square = int(dx_squares/3)
+        candidates_centers = self.get_candidates_centers(center_vote, dvc, dy_candidates, n_candidates=6)
+        candidates_squares = self.get_candidate_squares(image, candidates_centers, dx_squares, dy_square)
+        dst_t = self.match_feature(image, self.total_feature)
+        center_t = self.get_feature_center(dst_t)
+        total_square = image[int(center_t[1]-2*dy_square):int(center_t[1]+2*dy_square),
+                            int(center_vote[0]-dx_squares/2):int(center_vote[0]+dx_squares/2)]
+        return total_square, candidates_squares
+
+    def resolve_pages_by_features(self):
+        dvc, dy_candidates = self.get_features_relations(self.gray_images[0], vote_feature=self.votes_feature,
+                                                          c1_feature=self.c1_feature, c2_feature=self.c2_feature)
+        nivelation, candidates1= self.resolve_first_page_by_features(self.gray_images[0], self.votes_feature, dvc, dy_candidates)
+        total, candidates2= self.resolve_second_page_by_features(self.gray_images[1], self.votes_feature, dvc, dy_candidates)
+
+        return nivelation, total, candidates1 +  candidates2
+
+    def resolve_first_page_by_contours(self, image):
         """ Resolve the first page of the canvass, extracting the nivelation and candidates sections
 
         Args:
@@ -207,7 +322,7 @@ class E14Extractor():
             c) else np.array([]) for c in candidates]
         return nivelation, candidates
 
-    def resolve_second_page(self, image):
+    def resolve_second_page_by_contours(self, image):
         """ Resolve the second page of the canvass, extracting the total count and candidates sections
 
         Args:
@@ -237,16 +352,32 @@ class E14Extractor():
         """
         return not np.any(image <= self.treshold_value)
 
+    def resolve_pages_by_contours(self):
+        """ Resolve both pages of the canvass, extracting the nivelation, total count, and candidates sections using contours
+        Returns:
+            tuple: A tuple containing the nivelation, total count, and candidates sections as numpy arrays
+        """
+        nivelation, candidates1 = self.resolve_first_page_by_contours(self.gray_images[0])
+        total_count, candidates2 = self.resolve_second_page_by_contours(self.gray_images[1])
+        return nivelation, total_count, candidates1 + candidates2
+
     def resolve_pages(self):
         """ Resolve both pages of the canvass, extracting the nivelation, total count, and candidates sections
 
         Returns:
             tuple: A tuple containing the nivelation, total count, and candidates sections as numpy arrays
         """
-        nivelation, candidates1 = self.resolve_first_page(self.gray_images[0])
-        total_count, candidates2 = self.resolve_second_page(
-            self.gray_images[1])
-        return nivelation, total_count, candidates1 + candidates2
+        try: 
+            if self.verbose:
+                print("Resolving pages by contours...")
+            return self.resolve_pages_by_contours()
+        except ValueError as e:
+            try:
+                if self.verbose:
+                    print("Failed to resolve pages by contours, trying features...")
+                return self.resolve_pages_by_features()
+            except ValueError as e:
+                raise ValueError("Could not resolve pages by contours or features") from e
 
     def split_cells(self, image, splits=(1, 1)):
         """ Split the image into cells according to the given splits, the image must be in grayscale
@@ -351,4 +482,3 @@ class E14Extractor():
         data = self.resolve_as_json()
         with open(filename, 'w') as f:
             json.dump(data, f)
-
